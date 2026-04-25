@@ -1,181 +1,84 @@
-require("dotenv").config();
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import mongoose from "mongoose";
+import http from "http";
+import { Server } from "socket.io";
 
-const express = require("express");
-const cors = require("cors");
-const jwt = require("jsonwebtoken");
-const bcrypt = require("bcryptjs");
-const { v4: uuidv4 } = require("uuid");
-const { Pool } = require("pg");
+dotenv.config();
 
 const app = express();
 
-app.use(cors());
+/* ---------------- MIDDLEWARE ---------------- */
+app.use(cors({
+  origin: "*"
+}));
 app.use(express.json());
 
-// ======================
-// SINGLE SECRET (IMPORTANT)
-// ======================
-const SECRET = process.env.JWT_SECRET || "supersecret";
+/* ---------------- HTTP SERVER ---------------- */
+const server = http.createServer(app);
 
-// ======================
-// DATABASE
-// ======================
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+/* ---------------- SOCKET.IO ---------------- */
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+  },
 });
 
-// ======================
-// AUTH MIDDLEWARE (FIXED)
-// ======================
-function auth(req, res, next) {
-  const authHeader = req.headers.authorization;
+/* ---------------- DB CONNECT ---------------- */
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(() => console.log("MongoDB connected 🗄️"))
+  .catch((err) => console.log("DB error:", err));
 
-  if (!authHeader) {
-    return res.status(401).json({ error: "No token provided" });
-  }
+/* ---------------- SOCKET CONNECTION ---------------- */
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
 
-  const parts = authHeader.split(" ");
+  socket.on("join", (userId) => {
+    socket.join(userId);
+  });
 
-  if (parts.length !== 2 || parts[0] !== "Bearer") {
-    return res.status(401).json({ error: "Invalid token format" });
-  }
+  socket.on("sendMessage", (data) => {
+    const { senderId, receiverId, message } = data;
 
-  const token = parts[1];
+    io.to(receiverId).emit("receiveMessage", {
+      senderId,
+      message,
+      createdAt: new Date(),
+    });
 
-  try {
-    req.user = jwt.verify(token, SECRET); // 🔥 SAME SECRET USED HERE
-    next();
-  } catch (err) {
-    return res.status(403).json({ error: "Invalid token" });
-  }
-}
+    io.to(senderId).emit("receiveMessage", {
+      senderId,
+      message,
+      createdAt: new Date(),
+    });
+  });
 
-// ======================
-// REGISTER
-// ======================
-app.post("/register", async (req, res) => {
-  try {
-    const { email, password, role } = req.body;
-
-    const hashed = await bcrypt.hash(password, 10);
-
-    const result = await pool.query(
-      "INSERT INTO users (email, password, role) VALUES ($1,$2,$3) RETURNING *",
-      [email, hashed, role]
-    );
-
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  socket.on("disconnect", () => {
+    console.log("User disconnected");
+  });
 });
 
-// ======================
-// LOGIN
-// ======================
-app.post("/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    const result = await pool.query(
-      "SELECT * FROM users WHERE email=$1",
-      [email]
-    );
-
-    const user = result.rows[0];
-
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-      return res.status(401).send("Invalid credentials");
-    }
-
-    const token = jwt.sign(
-      { id: user.id, role: user.role },
-      SECRET // 🔥 SAME SECRET
-    );
-
-    res.json({ token });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+/* ---------------- BASIC TEST ROUTE ---------------- */
+app.get("/", (req, res) => {
+  res.send("BahamasEdu API is running 🚀");
 });
 
-// ======================
-// CREATE QUIZ
-// ======================
-app.post("/quiz", auth, async (req, res) => {
-  try {
-    const { title, questions } = req.body;
+/* ---------------- EXAMPLE AUTH (BASIC) ---------------- */
+app.post("/login", (req, res) => {
+  const { email } = req.body;
 
-    const result = await pool.query(
-      "INSERT INTO quizzes (title, questions) VALUES ($1,$2) RETURNING *",
-      [title, JSON.stringify(questions)]
-    );
-
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  res.json({
+    token: "demo-token",
+    role: email.includes("teacher") ? "teacher" : "student",
+    userId: "123",
+  });
 });
 
-// ======================
-// GET QUIZZES
-// ======================
-app.get("/quiz", async (req, res) => {
-  try {
-    const result = await pool.query("SELECT * FROM quizzes");
-
-    res.json(
-      result.rows.map(q => ({
-        ...q,
-        questions: JSON.parse(q.questions)
-      }))
-    );
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ======================
-// SUBMIT QUIZ
-// ======================
-app.post("/submit", auth, async (req, res) => {
-  try {
-    const { quizId, score } = req.body;
-
-    await pool.query(
-      "INSERT INTO submissions (userid, quizid, score) VALUES ($1,$2,$3)",
-      [req.user.id, quizId, score]
-    );
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ======================
-// START SERVER
-// ======================
-app.listen(5000, () => {
-  console.log("🚀 Server running on port 5000");
-});
-app.post("/quiz", authenticateToken, async (req, res) => {
-  const { title, questions } = req.body;
-
-  const result = await pool.query(
-    `INSERT INTO quizzes (id, teacher_id, title, questions)
-     VALUES (gen_random_uuid(), $1, $2, $3)
-     RETURNING *`,
-    [req.user.id, title, JSON.stringify(questions)]
-  );
-
-  res.json(result.rows[0]);
-});
+/* ---------------- PORT (IMPORTANT FOR RENDER) ---------------- */
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-  console.log(`Server running on ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT} ⚡`);
 });
-import dotenv from "dotenv";
-dotenv.config();
